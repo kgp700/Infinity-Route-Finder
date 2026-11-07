@@ -1,5 +1,5 @@
 // 앱 화면 파일만 캐시합니다. 지도와 경로 계산은 항상 실시간으로 불러옵니다.
-var CACHE = 'detour-v10';
+var CACHE = 'detour-v11';
 var SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', function (e) {
