@@ -59,10 +59,16 @@ button{cursor:pointer}
 /* 하단 시트 */
 #sheet{position:absolute;left:0;right:0;bottom:0;z-index:25;background:var(--bg);
   border-radius:20px 20px 0 0;box-shadow:0 -6px 24px rgba(17,24,39,.14);
-  padding:6px 16px calc(16px + var(--safeB));max-height:64dvh;overflow-y:auto;
-  display:flex;flex-direction:column;gap:12px;transition:transform .2s}
+  padding:4px 16px calc(16px + var(--safeB));max-height:52dvh;overflow-y:auto;overscroll-behavior:contain;
+  display:flex;flex-direction:column;gap:12px;transition:max-height .2s}
+#sheet.full{max-height:88dvh}
+#sheet.collapsed{overflow:hidden;gap:0;padding-bottom:calc(8px + var(--safeB))}
 #sheet.collapsed .body{display:none}
-.grab{align-self:center;width:64px;height:24px;border:0;background:none;display:flex;align-items:center;justify-content:center;flex:none}
+.grab{align-self:stretch;height:28px;border:0;background:none;display:flex;align-items:center;justify-content:center;flex:none;touch-action:none}
+.peek{display:none;align-items:center;gap:10px;width:100%;min-height:48px;border:0;background:none;padding:0 2px;text-align:left;font-size:16px;font-weight:700;touch-action:none}
+.peek span{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.peek em{font-style:normal;font-size:13px;font-weight:600;color:var(--accent);flex:none}
+#sheet.collapsed .peek{display:flex}
 .grab i{width:40px;height:4px;border-radius:2px;background:#D1D5DB}
 .body{display:flex;flex-direction:column;gap:12px}
 h2{margin:0;font-size:20px;font-weight:700;letter-spacing:-.01em}
@@ -191,7 +197,8 @@ p.sub{margin:0;font-size:15px;line-height:1.5;color:var(--ink3)}
   </div>
 
   <div id="sheet">
-    <button class="grab" id="grab" aria-label="시트 접기/펼치기"><i></i></button>
+    <button class="grab" id="grab" aria-label="패널 접기/펼치기"><i></i></button>
+    <button class="peek" id="peek" aria-label="패널 펼치기"><span id="peekTxt"></span><em>펼치기 ▲</em></button>
     <div class="body" id="sheetBody"></div>
   </div>
 
@@ -201,6 +208,7 @@ p.sub{margin:0;font-size:15px;line-height:1.5;color:var(--ink3)}
         <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"></path></svg>
       </button>
       <input id="q" type="search" placeholder="장소, 주소 검색" autocomplete="off" enterkeyhint="search">
+      <button class="btn" id="qGo" style="height:52px;flex:none">검색</button>
     </div>
     <div class="list" id="results"></div>
   </div>
@@ -256,6 +264,8 @@ var S = {
   tol: LS.get('tol', 10),
   err: '',
   traffic: true,
+  sheet: 'half',
+  baseCache: null,
   editing: 'dest'
 };
 
@@ -494,6 +504,11 @@ function loadBase() {
   S.mode = 'loading'; S.base = null; S.cands = []; S.segs = []; S.pendingA = null; S.err = '';
   render();
   var se = [pt(S.start), pt(S.dest)];
+  var key = se.map(function (c) { return c[0].toFixed(3) + ',' + c[1].toFixed(3); }).join('|') + (hasTmap() ? '|t' : '');
+  if (S.baseCache && S.baseCache.key === key && Date.now() - S.baseCache.at < 5 * 60 * 1000) {
+    var cb = S.baseCache.base;
+    S.base = cb; S.jams = jamRuns(cb); S.mode = 'pickA'; render(); fitTo(cb.coords); return;
+  }
   var viaOrs = function () { return ors(se).then(function (r) { if (!r.length) throw new Error('경로를 찾지 못했어요'); return r[0]; }); };
   var get = hasTmap() ? tmap(se).catch(function (e) {
     if (isAuthErr(e)) S.err = 'TMAP 키를 확인해 주세요. 정체 색상 없이 계속합니다';
@@ -502,6 +517,7 @@ function loadBase() {
   }) : viaOrs();
   get.then(function (b) {
     S.base = b; S.base.cum = cumOf(S.base.coords); S.jams = jamRuns(S.base);
+    S.baseCache = { key: key, at: Date.now(), base: b };
     S.mode = 'pickA'; render(); fitTo(S.base.coords);
   }).catch(fail);
 }
@@ -703,9 +719,10 @@ function computeCands() {
   var H = null;
   function build(P, ps, preBest) {
     return (preBest ? Promise.resolve(preBest) : orsX([P, D], ps, null, H).then(function (r) { return r[0]; })).then(function (best) {
-      var pRe = R ? orsX([P, R, D], ps, null, H).then(function (r) { return r[0]; }).catch(function () { return null; }) : Promise.resolve(null);
       var info = analyze(best.coords, m, lastB, total - 5000), pNo = Promise.resolve(null);
-      if (info.runs.length) {
+      var rejoins = info.rejoin != null;
+      var pRe = (R && !rejoins) ? orsX([P, R, D], ps, null, H).then(function (r) { return r[0]; }).catch(function () { return null; }) : Promise.resolve(null);
+      if (rejoins && info.runs.length) {
         var X = info.runs[0].pts[0].c, xi = nearestIdx(best.coords, X).i;
         pNo = orsX([X, D], ps, ['highways']).then(function (r) { return { xi: xi, tail: r[0] }; }).catch(function () { return null; });
       }
@@ -716,10 +733,10 @@ function computeCands() {
   function solve(ctx, ps, sx, iter) {
     var routes = [sx.best, sx.re, sx.no && sx.no.tail];
     var add = opt('narrow') ? narrowBoxes(routes, ctx.seen) : [];
-    var pk = opt('kids') && iter < 2 ? schoolBoxes(routes, ctx) : Promise.resolve([]);
+    var pk = opt('kids') && iter < 1 ? schoolBoxes(routes, ctx) : Promise.resolve([]);
     return pk.then(function (kb) {
       add = add.concat(kb);
-      if (!add.length || iter >= 3) return sx;
+      if (!add.length || iter >= 2) return sx;
       var np = ps.concat(add);
       return build(ctx.P, np).then(function (nsx) { return solve(ctx, np, nsx, iter + 1); }, function (e) {
         if (isAuthErr(e)) throw e;
@@ -800,7 +817,7 @@ function finishCands(list, m, aAlong, lastB, total) {
       c.hitsJam = c.real ? passesSegs(c.coords) : false;
     });
     S.cands = uniq; S.sel = null; S.mode = 'result';
-    render(); fitTo(S.base.coords.concat(uniq[0].coords));
+    sheetState('half'); render(); fitTo(S.base.coords.concat(uniq[0].coords));
   });
 }
 
@@ -956,7 +973,7 @@ function draw() {
 
 /* ---------- 탭 처리 ---------- */
 function onTap(p) {
-  if (S.mode === 'pickA') { S.pendingA = p; S.mode = 'pickB'; render(); return; }
+  if (S.mode === 'pickA') { S.pendingA = p; S.mode = 'pickB'; sheetState('peek'); render(); return; }
   if (S.mode === 'pickB') {
     if (hav(S.pendingA, p) < 300) { toast('A와 너무 가까워요. 정체가 끝나는 지점을 탭하세요'); return; }
     var a = S.pendingA; S.pendingA = null; addSegment(a, p); return;
@@ -967,6 +984,26 @@ function optsHtml() {
   return '<div class="chips">' +
     '<button class="chip opt' + (opt('narrow') ? ' on' : '') + '" data-act="opt" data-k="narrow"><i></i>좁은 길·농로·골목 피하기</button>' +
     '<button class="chip opt' + (opt('kids') ? ' on' : '') + '" data-act="opt" data-k="kids"><i></i>어린이 보호구역 피하기</button></div>';
+}
+
+function sheetState(st) {
+  S.sheet = st;
+  var el = $('sheet');
+  el.classList.toggle('collapsed', st === 'peek');
+  el.classList.toggle('full', st === 'full');
+  if (st !== 'peek') el.scrollTop = 0;
+}
+function peekText() {
+  if (S.mode === 'needDest') return '어디로 갈까요?';
+  if (S.mode === 'loading' || S.mode === 'computing') return '경로 계산 중…';
+  if (S.mode === 'error') return S.err || '오류가 있어요';
+  if (S.mode === 'pickB') return 'B: 정체가 끝나는 곳을 탭하세요';
+  if (S.mode === 'pickA') return '피할 구간 고르기' + (S.jams && S.jams.length ? ' · 정체 ' + S.jams.length + '곳' : '') + (S.segs.length ? ' · 추가됨 ' + S.segs.length : '');
+  if (S.mode === 'result') {
+    var c = selected(), T = { best: '최적 우회', reenter: 'B 지나서 바로 재진입', nohwy: '고속도로 없이 끝까지' };
+    return c ? (T[c.type] || '우회 경로') + ' ' + (c.extra >= 0 ? '+' : '') + c.extra + '분 · 경유지 ' + c.wps.length + '곳' : '결과';
+  }
+  return '';
 }
 
 /* ---------- 화면 (하단 시트) ---------- */
@@ -1055,6 +1092,7 @@ function render() {
       word + ' ' + (sel.extra >= 0 ? '+' : '') + sel.extra + '분 · 경유지 ' + sel.wps.length + '곳</small></span></button>';
   }
   $('sheetBody').innerHTML = h;
+  $('peekTxt').textContent = peekText();
   if (map) draw();
 }
 
@@ -1185,9 +1223,24 @@ document.addEventListener('click', function (e) {
 $('destBtn').onclick = function () { openSearch('dest'); };
 $('startBtn').onclick = function () { openSearch('start'); };
 $('searchClose').onclick = function () { $('search').classList.remove('show'); };
-$('q').addEventListener('input', function () { clearTimeout(qTimer); qTimer = setTimeout(doSearch, 300); });
+$('qGo').onclick = function () { doSearch(); };
 $('q').addEventListener('keydown', function (e) { if (e.key === 'Enter') { clearTimeout(qTimer); doSearch(); } });
-$('grab').onclick = function () { $('sheet').classList.toggle('collapsed'); };
+$('grab').onclick = function () { sheetState(S.sheet === 'peek' ? 'half' : (S.sheet === 'full' ? 'half' : 'peek')); };
+$('peek').onclick = function () { sheetState('half'); };
+(function () {
+  // 손잡이·요약줄을 위아래로 밀어서 접기/펼치기 (패널 내용이 맨 위일 때는 내용 영역에서 아래로 밀어도 접힘)
+  var y0 = null, fromHandle = false, sh = $('sheet');
+  sh.addEventListener('touchstart', function (e) {
+    fromHandle = !!e.target.closest('#grab, #peek');
+    y0 = (fromHandle || sh.scrollTop <= 0) ? e.touches[0].clientY : null;
+  }, { passive: true });
+  sh.addEventListener('touchend', function (e) {
+    if (y0 === null) return;
+    var dy = e.changedTouches[0].clientY - y0; y0 = null;
+    if (dy > (fromHandle ? 30 : 70)) sheetState(S.sheet === 'full' ? 'half' : 'peek');
+    else if (fromHandle && dy < -30) sheetState(S.sheet === 'peek' ? 'half' : 'full');
+  }, { passive: true });
+})();
 $('send').addEventListener('click', function (e) { if (e.target === $('send')) $('send').classList.remove('show'); });
 $('trafficBtn').onclick = function () {
   S.traffic = !S.traffic; this.classList.toggle('on', S.traffic);
