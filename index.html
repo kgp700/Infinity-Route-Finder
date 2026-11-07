@@ -110,6 +110,10 @@ p.sub{margin:0;font-size:15px;line-height:1.5;color:var(--ink3)}
 .chips{display:flex;gap:8px;flex-wrap:wrap}
 .chip{height:44px;padding:0 14px;border-radius:999px;border:1px solid #D1D5DB;background:var(--bg);font-size:15px;max-width:100%;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chip.jam{border-color:#FCA5A5;background:#FEF2F2;color:#991B1B;font-weight:600}
+.chip.jam.added{border-color:var(--line);background:var(--soft);color:var(--ink3);font-weight:500}
+.jamlist{display:flex;flex-direction:column;gap:8px}
+.jamlist .chips{gap:6px}
 .spin{width:22px;height:22px;border-radius:50%;border:3px solid var(--line);border-top-color:var(--accent);animation:sp 0.8s linear infinite;flex:none}
 @keyframes sp{to{transform:rotate(360deg)}}
 .err{padding:12px 14px;border-radius:12px;background:#FEF2F2;color:#991B1B;font-size:14px;line-height:1.5}
@@ -211,7 +215,11 @@ p.sub{margin:0;font-size:15px;line-height:1.5;color:var(--ink3)}
       <label>OpenRouteService 키
         <input id="orsKey" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="예: 5b3ce3...">
       </label>
-      <p class="muted">openrouteservice.org 가입 → Dashboard에서 무료(Standard) 토큰 발급.</p>
+      <p class="muted">account.heigit.org/signup 가입 → account.heigit.org 대시보드에서 무료(Standard) 키 발급.</p>
+      <label>TMAP 앱 키 (선택: 실시간 정체 색상과 실제 소요시간)
+        <input id="tmapKey" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="비워두면 정체 색상 없이 동작">
+      </label>
+      <p class="muted">openapi.sk.com 가입 → 앱 만들기 → TMAP API 사용 신청 → 앱 키. 무료 하루 1,000건, 넘으면 자동 차단(과금 없음).</p>
       <button class="btn primary" id="saveKeys">저장하고 시작</button>
       <button class="btn full" id="closeSetup" style="display:none">닫기</button>
     </div>
@@ -294,6 +302,64 @@ function ors(coords, extra) {
   });
 }
 
+/* ---------- 실시간 교통 (TMAP, 선택) ---------- */
+function hasTmap() { return !!LS.get('tmapKey', ''); }
+// coords: [출발, (경유 최대 5), 도착]  → 실시간 소요시간과 구간별 정체 단계
+function tmap(coords) {
+  var s = coords[0], e = coords[coords.length - 1], pass = coords.slice(1, -1).slice(0, 5);
+  var body = new URLSearchParams({
+    appKey: LS.get('tmapKey', ''), startX: s[0], startY: s[1], endX: e[0], endY: e[1],
+    reqCoordType: 'WGS84GEO', resCoordType: 'WGS84GEO', searchOption: '0', trafficInfo: 'Y',
+    startName: encodeURIComponent('출발'), endName: encodeURIComponent('도착')
+  });
+  if (pass.length) body.set('passList', pass.map(function (p) { return p[0].toFixed(7) + ',' + p[1].toFixed(7); }).join('_'));
+  return fetch('https://apis.openapi.sk.com/tmap/routes?version=1&format=json', {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' }, body: body.toString()
+  }).then(function (r) {
+    return r.json().catch(function () { return {}; }).then(function (j) {
+      if (!r.ok || !j.features) {
+        var m = (j && j.error && (j.error.message || j.error.code)) || ('HTTP ' + r.status);
+        var err = new Error('TMAP: ' + m); err.status = r.status; throw err;
+      }
+      return parseTmap(j);
+    });
+  });
+}
+function parseTmap(j) {
+  var coords = [], traffic = [], names = [], roads = {}, head = (j.features[0] || {}).properties || {};
+  j.features.forEach(function (f) {
+    if (!f.geometry || f.geometry.type !== 'LineString') return;
+    var cs = f.geometry.coordinates || [], off = coords.length, pr = f.properties || {};
+    var tr = f.geometry.traffic || pr.traffic || [];
+    if (tr.length && typeof tr[0] === 'number') tr = [tr];
+    tr.forEach(function (t) { if (t && t.length >= 3) traffic.push({ from: off + (+t[0]), to: off + Math.min(+t[1], cs.length - 1), lvl: +t[2] }); });
+    var nm = (pr.name || '').trim();
+    if (nm && nm !== '-') { names.push({ from: off, to: off + cs.length - 1, name: nm }); roads[nm] = (roads[nm] || 0) + (+pr.distance || 0); }
+    for (var i = 0; i < cs.length; i++) coords.push([+cs[i][0], +cs[i][1]]);
+  });
+  if (coords.length < 2) throw new Error('TMAP: 경로 정보가 비어 있어요');
+  var top = Object.keys(roads).sort(function (a, b) { return roads[b] - roads[a]; }).slice(0, 3).filter(function (n) { return roads[n] > 3000; });
+  return { coords: coords, dist: +head.totalDistance || 0, dur: +head.totalTime || 0, traffic: traffic, names: names, roads: top, real: true };
+}
+function nameAt(route, i) {
+  var n = (route.names || []).filter(function (x) { return i >= x.from && i <= x.to; })[0];
+  return n ? n.name : '';
+}
+// 지체(3)·정체(4)가 이어진 구간 묶기
+function jamRuns(route) {
+  if (!route.traffic || !route.traffic.length) return [];
+  var cum = route.cum || cumOf(route.coords), last = route.coords.length - 1, runs = [], cur = null;
+  route.traffic.filter(function (t) { return t.lvl >= 3; }).sort(function (a, b) { return a.from - b.from; }).forEach(function (t) {
+    var to = Math.min(t.to, last);
+    if (cur && cum[t.from] - cum[cur.to] < 400) cur.to = Math.max(cur.to, to);
+    else { cur = { from: t.from, to: to }; runs.push(cur); }
+  });
+  return runs.map(function (r) {
+    return { i0: r.from, i1: r.to, len: cum[r.to] - cum[r.from], at: cum[r.from], name: nameAt(route, r.from) || nameAt(route, r.to) };
+  }).filter(function (r) { return r.len >= 500 && r.i1 > r.i0; });
+}
+var LVL_COLOR = { 0: '#9CA3AF', 1: '#16A34A', 2: '#F59E0B', 3: '#EA580C', 4: '#DC2626' };
+
 function mainRoads(p) {
   var acc = {};
   (p.segments || []).forEach(function (sg) {
@@ -326,36 +392,75 @@ function boxesAlong(coords) {
   return { boxes: boxes, length: total };
 }
 
-/* 우회 경로가 기준 경로에서 벗어난 구간에서 네이버에 넘길 경유지 고르기 */
-function pickWaypoints(cand, base) {
+/* ---------- 기준 경로 위치 계산 도우미 ---------- */
+function cumOf(coords) { var c = [0]; for (var i = 1; i < coords.length; i++) c.push(c[i - 1] + hav(coords[i - 1], coords[i])); return c; }
+function nearestIdx(coords, p) { var bi = 0, bd = 1e12; for (var i = 0; i < coords.length; i++) { var d = hav(coords[i], p); if (d < bd) { bd = d; bi = i; } } return { i: bi, d: bd }; }
+function pointAt(coords, cum, t) {
+  if (t <= 0) return coords[0];
+  for (var j = 1; j < coords.length; j++) if (cum[j] >= t) {
+    var f = (t - cum[j - 1]) / ((cum[j] - cum[j - 1]) || 1), a = coords[j - 1], b = coords[j];
+    return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+  }
+  return coords[coords.length - 1];
+}
+function thin(cs, gap) { var out = [cs[0]], last = cs[0]; for (var i = 1; i < cs.length; i++) { if (hav(last, cs[i]) >= gap) { out.push(cs[i]); last = cs[i]; } } out.push(cs[cs.length - 1]); return out; }
+// 어떤 점이 기준 경로에서 얼마나 떨어져 있고, 기준 경로의 몇 m 지점 옆인지 계산
+function matcher(base) {
   var lat0 = base[0][1], lng0 = base[0][0], kx = 111320 * Math.cos(lat0 * Math.PI / 180), ky = 110540;
   function P(c) { return [(c[0] - lng0) * kx, (c[1] - lat0) * ky]; }
-  function thin(cs, gap) { var out = [cs[0]], last = cs[0]; for (var i = 1; i < cs.length; i++) { if (hav(last, cs[i]) >= gap) { out.push(cs[i]); last = cs[i]; } } out.push(cs[cs.length - 1]); return out; }
-  var B = thin(base, 150).map(P), C = thin(cand, 100);
-  function dSeg(p, a, b) {
-    var vx = b[0] - a[0], vy = b[1] - a[1], wx = p[0] - a[0], wy = p[1] - a[1], L = vx * vx + vy * vy;
-    var t = L ? Math.max(0, Math.min(1, (wx * vx + wy * vy) / L)) : 0;
-    var dx = wx - t * vx, dy = wy - t * vy; return Math.sqrt(dx * dx + dy * dy);
+  var B = [], along = 0;
+  for (var i = 0; i < base.length; i++) {
+    if (i) along += hav(base[i - 1], base[i]);
+    if (!B.length || i === base.length - 1 || hav(B[B.length - 1].c, base[i]) >= 120) { var q = P(base[i]); B.push({ x: q[0], y: q[1], al: along, c: base[i] }); }
   }
-  var runs = [], cur = null, cum = 0;
+  return function (c) {
+    var p = P(c), best = 1e12, bal = 0;
+    for (var k = 1; k < B.length; k++) {
+      var a = B[k - 1], b = B[k], vx = b.x - a.x, vy = b.y - a.y, wx = p[0] - a.x, wy = p[1] - a.y, L = vx * vx + vy * vy;
+      var t = L ? Math.max(0, Math.min(1, (wx * vx + wy * vy) / L)) : 0;
+      var dx = wx - t * vx, dy = wy - t * vy, d = Math.sqrt(dx * dx + dy * dy);
+      if (d < best) { best = d; bal = a.al + t * (b.al - a.al); }
+    }
+    return { d: best, along: bal };
+  };
+}
+
+/* 후보 경로 분석: 기준 경로에서 어디서 갈라지고, 정체 구간 뒤에서 다시 합류하는지 */
+function analyze(cand, m, afterAlong, beforeAlong) {
+  var C = thin(cand, 100), cum = 0, lastClose = 0, divAt = null, divAlong = null, rejoin = null, runs = [], cur = null;
   for (var i = 0; i < C.length; i++) {
     if (i) cum += hav(C[i - 1], C[i]);
-    var p = P(C[i]), best = 1e12;
-    for (var k = 1; k < B.length; k++) { var d = dSeg(p, B[k - 1], B[k]); if (d < best) best = d; if (best < 50) break; }
-    if (best > 350) { if (!cur) { cur = { pts: [], from: cum }; runs.push(cur); } cur.pts.push({ c: C[i], at: cum }); cur.to = cum; }
-    else cur = null;
+    var r = m(C[i]);
+    if (r.d > 350) {
+      if (divAt === null) { divAt = cum; divAlong = lastClose; }
+      if (!cur) { cur = { pts: [], from: cum }; runs.push(cur); }
+      cur.pts.push({ c: C[i], at: cum }); cur.to = cum;
+    } else {
+      cur = null;
+      if (r.d < 60) {
+        if (divAt === null) lastClose = r.along;
+        else if (rejoin === null && r.along > afterAlong && r.along < beforeAlong) rejoin = r.along;
+      }
+    }
   }
-  runs = runs.filter(function (r) { return r.to - r.from >= 800; });
+  return { divAlong: divAlong, rejoin: rejoin, runs: runs.filter(function (q) { return q.to - q.from >= 800; }) };
+}
+
+/* 네이버에 넘길 경유지: 첫 경유지는 고속도로를 나온 직후에 둬서 네이버가 같은 출구로 나가게 함 */
+function waypointsFrom(runs) {
   var wps = [];
-  runs.forEach(function (r) {
-    var len = r.to - r.from, fr = len < 3000 ? [0.5] : [0.33, 0.72];
-    fr.forEach(function (f) {
-      var t = r.from + len * f, bestP = r.pts[0];
-      r.pts.forEach(function (q) { if (Math.abs(q.at - t) < Math.abs(bestP.at - t)) bestP = q; });
-      wps.push(bestP.c);
-    });
+  function at(r, t) { var bp = r.pts[0]; r.pts.forEach(function (q) { if (Math.abs(q.at - t) < Math.abs(bp.at - t)) bp = q; }); return bp.c; }
+  runs.forEach(function (r, ri) {
+    var len = r.to - r.from;
+    if (ri === 0) {
+      wps.push(at(r, r.from + Math.min(1200, len * 0.3)));
+      if (len >= 3000) wps.push(at(r, r.from + len * 0.65));
+    } else {
+      if (len < 3000) wps.push(at(r, r.from + len * 0.5));
+      else { wps.push(at(r, r.from + len * 0.35)); wps.push(at(r, r.from + len * 0.75)); }
+    }
   });
-  if (wps.length > 5) { var out = []; for (var n = 0; n < 5; n++) out.push(wps[Math.round(n * (wps.length - 1) / 4)]); wps = out; }
+  if (wps.length > 5) { var out = [wps[0]]; for (var n = 1; n < 5; n++) out.push(wps[Math.round(n * (wps.length - 1) / 4)]); wps = out; }
   return wps;
 }
 
@@ -364,54 +469,178 @@ function loadBase() {
   if (!S.start || !S.dest) { S.mode = 'needDest'; render(); return; }
   S.mode = 'loading'; S.base = null; S.cands = []; S.segs = []; S.pendingA = null; S.err = '';
   render();
-  ors([pt(S.start), pt(S.dest)]).then(function (r) {
-    if (!r.length) throw new Error('경로를 찾지 못했어요');
-    S.base = r[0]; S.mode = 'pickA'; render(); fitTo(S.base.coords);
+  var se = [pt(S.start), pt(S.dest)];
+  var viaOrs = function () { return ors(se).then(function (r) { if (!r.length) throw new Error('경로를 찾지 못했어요'); return r[0]; }); };
+  var get = hasTmap() ? tmap(se).catch(function (e) {
+    if (isAuthErr(e)) S.err = 'TMAP 키를 확인해 주세요. 정체 색상 없이 계속합니다';
+    else S.err = '실시간 교통을 불러오지 못해 정체 색상 없이 계속합니다 (' + e.message + ')';
+    toast(S.err, 4000); return viaOrs();
+  }) : viaOrs();
+  get.then(function (b) {
+    S.base = b; S.base.cum = cumOf(S.base.coords); S.jams = jamRuns(S.base);
+    S.mode = 'pickA'; render(); fitTo(S.base.coords);
   }).catch(fail);
 }
 
 function addSegment(a, b) {
   S.mode = 'computing'; render();
-  var straight = hav(a, b);
-  ors([a, b]).then(function (r) {
-    var path = r[0];
-    if (path.dist > straight * 2.5 + 2000) {
-      return ors([b, a]).then(function (r2) {
-        if (r2[0].dist < path.dist) { toast('A→B를 진행 방향 순서로 탭하면 더 정확해요'); return r2[0]; }
-        return path;
-      });
-    }
-    return path;
-  }).then(function (path) {
-    var bx = boxesAlong(path.coords);
-    S.segs.push({ a: a, b: b, coords: path.coords, boxes: bx.boxes, length: bx.length });
-    return computeCands().catch(function (e) { S.segs.pop(); throw e; });
+  var base = S.base, na = nearestIdx(base.coords, a), nb = nearestIdx(base.coords, b), getPath;
+  var near = na.d < 600 && nb.d < 600;
+  if (near && nb.i < na.i) {
+    toast('진행 방향 순서로 찍어주세요. A와 B를 바꿔서 계산할게요');
+    var t = na; na = nb; nb = t; t = a; a = b; b = t;
+  }
+  var onBase = near && nb.i > na.i;
+  if (onBase) {
+    getPath = Promise.resolve({ coords: base.coords.slice(na.i, nb.i + 1) });
+  } else {
+    var straight = hav(a, b);
+    getPath = ors([a, b]).then(function (r) {
+      var path = r[0];
+      if (path.dist > straight * 2.5 + 2000) {
+        return ors([b, a]).then(function (r2) { return r2[0].dist < path.dist ? r2[0] : path; });
+      }
+      return path;
+    });
+  }
+  getPath.then(function (path) {
+    return pushSeg({ a: a, b: b, coords: path.coords, aAlong: onBase ? base.cum[na.i] : null, bAlong: onBase ? base.cum[nb.i] : null });
   }).catch(fail);
 }
 
+function pushSeg(seg) {
+  var bx = boxesAlong(seg.coords);
+  seg.boxes = bx.boxes; seg.length = bx.length;
+  S.segs.push(seg);
+  return computeCands().catch(function (e) { S.segs.pop(); throw e; });
+}
+
+// 경로 위 빨간 정체 구간을 눌러서 바로 회피 구간으로 추가
+function addRun(i) {
+  var r = S.jams && S.jams[i], base = S.base;
+  if (!r) return;
+  if (S.segs.some(function (s) { return s.runIdx === i; })) { toast('이미 추가된 구간이에요'); return; }
+  S.pendingA = null; S.err = '';
+  S.mode = 'computing'; render();
+  pushSeg({ a: base.coords[r.i0], b: base.coords[r.i1], coords: base.coords.slice(r.i0, r.i1 + 1),
+    aAlong: base.cum[r.i0], bAlong: base.cum[r.i1], runIdx: i }).catch(fail);
+}
+
+function isAuthErr(e) { return e && (e.status === 401 || e.status === 403 || e.status === 429); }
+
+/* A까지는 기존 경로 그대로, A 직전에 빠져나와서 목적지까지의 우회 경로 3종을 비교 */
 function computeCands() {
   S.mode = 'computing'; render();
   var polys = []; S.segs.forEach(function (s) { polys = polys.concat(s.boxes); });
   var avoid = { type: 'MultiPolygon', coordinates: polys };
+  var onSegs = S.segs.filter(function (s) { return s.aAlong !== null; });
+  if (!onSegs.length) return computeCandsWhole(avoid);
+
+  var base = S.base, total = base.cum[base.cum.length - 1];
+  var aAlong = Math.min.apply(null, onSegs.map(function (s) { return s.aAlong; }));
+  var lastB = Math.max.apply(null, onSegs.map(function (s) { return s.bAlong; }));
+  var D = pt(S.dest), Sx = pt(S.start), offs = [1500, 5000, 12000];
+
+  // 갈림 지점 P: A보다 조금 앞의 기존 경로 위 지점 (출구가 멀면 더 앞에서 다시 시도)
+  function attempt(k) {
+    if (k >= offs.length) return Promise.reject(new Error('A 앞에서 빠져나갈 길을 찾지 못했어요. A를 정체 직전 나들목(IC)에 찍어보세요'));
+    var pAlong = aAlong - offs[k], atStart = pAlong <= 300;
+    var P = atStart ? Sx : pointAt(base.coords, base.cum, pAlong);
+    return ors([P, D], { options: { avoid_polygons: avoid } }).then(function (r) {
+      return { P: P, atStart: atStart, best: r[0] };
+    }, function (e) {
+      if (isAuthErr(e) || atStart) throw e;
+      return attempt(k + 1);
+    });
+  }
+
+  return attempt(0).then(function (st) {
+    var m = matcher(base.coords);
+    var pPrefix = st.atStart ? Promise.resolve(null) : ors([Sx, st.P]).then(function (r) { return r[0]; });
+
+    // B 지나서 바로 같은 길로 재진입
+    var rAlong = lastB + 300, R = rAlong < total - 2000 ? pointAt(base.coords, base.cum, rAlong) : null;
+    var pRe = R ? ors([st.P, R, D], { options: { avoid_polygons: avoid } }).then(function (r) { return r[0]; }).catch(function () { return null; }) : Promise.resolve(null);
+
+    // 고속도로를 빠져나온 뒤에는 고속도로 없이 끝까지
+    var info = analyze(st.best.coords, m, lastB, total - 5000), pNo = Promise.resolve(null);
+    if (info.runs.length) {
+      var X = info.runs[0].pts[0].c, bc = st.best.coords, head = bc.slice(0, nearestIdx(bc, X).i + 1);
+      var headDist = cumOf(head).pop();
+      pNo = ors([X, D], { options: { avoid_polygons: avoid, avoid_features: ['highways'] } }).then(function (r) {
+        var tail = r[0];
+        return { coords: head.concat(tail.coords), dist: headDist + tail.dist, dur: st.best.dur * (headDist / (st.best.dist || 1)) + tail.dur, roads: tail.roads };
+      }).catch(function () { return null; });
+    }
+
+    return Promise.all([pPrefix, pRe, pNo]).then(function (res) {
+      var pre = res[0];
+      function join(suf, type) {
+        if (!suf) return null;
+        return { type: type, coords: pre ? pre.coords.concat(suf.coords) : suf.coords,
+          dist: (pre ? pre.dist : 0) + suf.dist, dur: (pre ? pre.dur : 0) + suf.dur, roads: suf.roads };
+      }
+      return finishCands([join(st.best, 'best'), join(res[1], 'reenter'), join(res[2], 'nohwy')].filter(Boolean), m, aAlong, lastB, total);
+    });
+  });
+}
+
+/* A가 기존 경로 위에 없을 때: 출발지부터 전체를 다시 계산 */
+function computeCandsWhole(avoid) {
   var se = [pt(S.start), pt(S.dest)];
   var p1 = ors(se, { options: { avoid_polygons: avoid }, alternative_routes: { target_count: 3, weight_factor: 1.6, share_factor: 0.6 } })
-    .catch(function (e) { if (e.status === 401 || e.status === 403 || e.status === 429) throw e; return ors(se, { options: { avoid_polygons: avoid } }); });
+    .catch(function (e) { if (isAuthErr(e)) throw e; return ors(se, { options: { avoid_polygons: avoid } }); });
   var p2 = ors(se, { options: { avoid_polygons: avoid, avoid_features: ['highways'] } }).catch(function () { return []; });
   return Promise.all([p1, p2]).then(function (res) {
-    var list = res[0].concat(res[1].map(function (c) { c.noHwy = true; return c; }));
-    var uniq = [];
-    list.forEach(function (c) {
-      var dup = uniq.some(function (u) { return Math.abs(u.dist - c.dist) < Math.max(300, u.dist * 0.01) && Math.abs(u.dur - c.dur) < 90; });
-      if (!dup) uniq.push(c);
-    });
-    if (!uniq.length) throw new Error('회피 조건을 지키는 경로를 찾지 못했어요');
-    uniq.forEach(function (c, i) {
-      c.id = 'c' + i;
+    var list = res[0].map(function (c) { c.type = 'alt'; return c; }).concat(res[1].map(function (c) { c.type = 'nohwy'; return c; }));
+    var total = S.base.cum[S.base.cum.length - 1];
+    toast('A가 지금 경로 위에 없어서 출발지부터 다시 계산했어요');
+    return finishCands(list, matcher(S.base.coords), null, null, total);
+  });
+}
+
+function finishCands(list, m, aAlong, lastB, total) {
+  var uniq = [];
+  list.forEach(function (c) {
+    var dup = uniq.some(function (u) { return Math.abs(u.dist - c.dist) < Math.max(300, u.dist * 0.01) && Math.abs(u.dur - c.dur) < 90; });
+    if (!dup) uniq.push(c);
+  });
+  if (!uniq.length) throw new Error('회피 조건을 지키는 경로를 찾지 못했어요');
+  uniq.forEach(function (c, i) {
+    var inf = analyze(c.coords, m, lastB == null ? 0 : lastB, total - 5000);
+    c.id = 'c' + i;
+    c.wps = waypointsFrom(inf.runs);
+    c.exitBefore = (aAlong != null && inf.divAlong != null) ? Math.max(0, aAlong - inf.divAlong) : null;
+    c.rejoin = inf.rejoin != null;
+  });
+  return retime(uniq).then(function () {
+    uniq.forEach(function (c) {
       c.extra = Math.round((c.dur - S.base.dur) / 60);
-      c.wps = pickWaypoints(c.coords, S.base.coords);
+      c.hitsJam = c.real ? passesSegs(c.coords) : false;
     });
     S.cands = uniq; S.sel = null; S.mode = 'result';
     render(); fitTo(S.base.coords.concat(uniq[0].coords));
+  });
+}
+
+// 실시간 교통으로 다시 계산: 네이버에 넘길 경유지와 같은 경유지로 TMAP 경로를 받아서
+// 실제 예상 시간, 정체 색상, 실제로 그 길로 가는지까지 확인
+function retime(list) {
+  if (!hasTmap() || !S.base.real) return Promise.resolve(list);
+  return Promise.all(list.map(function (c) {
+    return tmap([pt(S.start)].concat(c.wps.slice(0, 5), [pt(S.dest)])).then(function (t) {
+      c.coords = t.coords; c.dist = t.dist; c.dur = t.dur; c.traffic = t.traffic; c.names = t.names; c.real = true;
+      if (t.roads.length) c.roads = t.roads;
+    }).catch(function () { c.real = false; });
+  })).then(function () { return list; });
+}
+// 경로가 회피하려던 구간을 1km 이상 지나가는지
+function passesSegs(coords) {
+  var C = thin(coords, 100);
+  return S.segs.some(function (s) {
+    var m = matcher(s.coords), n = 0;
+    C.forEach(function (c) { if (m(c).d < 30) n++; });
+    return n * 100 > 1000;
   });
 }
 
@@ -456,27 +685,77 @@ function fitTo(coords) {
 var lastTap = 0;
 function tapHandler(me) { var now = Date.now(); if (now - lastTap < 350) return; lastTap = now; onTap([me.latLng.getLng(), me.latLng.getLat()]); }
 
+// 정체 단계가 같은 이웃 구간을 합쳐서 선 개수를 줄인다
+function mergedTraffic(route) {
+  var out = [];
+  (route.traffic || []).slice().sort(function (a, b) { return a.from - b.from; }).forEach(function (t) {
+    if (t.to <= t.from) return;
+    var p = out[out.length - 1];
+    if (p && p.lvl === t.lvl && t.from <= p.to + 1) p.to = Math.max(p.to, t.to);
+    else out.push({ from: t.from, to: t.to, lvl: t.lvl });
+  });
+  return out;
+}
+// 경로를 정체 단계별 색으로 그리기 (흰 테두리 + 회색 바탕 + 색 구간)
+function drawTraffic(route, arr, w, onClick) {
+  function hook(l) { if (onClick) kakao.maps.event.addListener(l, 'click', onClick); arr.push(l); return l; }
+  hook(line(route.coords, { w: w + 5, c: '#FFFFFF', op: 1 }));
+  hook(line(route.coords, { w: w, c: LVL_COLOR[0], op: 1 }));
+  mergedTraffic(route).forEach(function (t) {
+    hook(line(route.coords.slice(t.from, t.to + 1), { w: w, c: LVL_COLOR[t.lvl] || LVL_COLOR[0], op: 1 }));
+  });
+}
+var jamTip = null;
+function showJamTip(r, on) {
+  if (jamTip) { jamTip.setMap(null); jamTip = null; }
+  if (!on) return;
+  var mid = S.base.coords[Math.round((r.i0 + r.i1) / 2)];
+  var el = document.createElement('div');
+  el.style.cssText = 'transform:translateY(-26px);background:#991B1B;color:#fff;font-size:13px;font-weight:700;padding:6px 10px;border-radius:8px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.25)';
+  el.textContent = '정체 ' + fmtKm(r.len) + ' · 클릭하면 회피 구간에 추가';
+  jamTip = new kakao.maps.CustomOverlay({ map: map, position: LL(mid), content: el, xAnchor: 0.5, yAnchor: 1, zIndex: 20 });
+}
+
 function draw() {
-  clear(ov.base); clear(ov.segs); clear(ov.cands); clear(ov.marks);
+  clear(ov.base); clear(ov.segs); clear(ov.cands); clear(ov.marks); showJamTip(null, false);
   if (ov.pending) { ov.pending.setMap(null); ov.pending = null; }
-  var showCands = S.mode === 'result';
+  var showCands = S.mode === 'result', picking = S.mode === 'pickA' || S.mode === 'pickB';
+  var accent = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#1D4ED8';
   if (S.base) {
-    ov.base.push(line(S.base.coords, { w: 10, c: '#FFFFFF', op: 0.9 }));
-    var bl = line(S.base.coords, { w: 5, c: '#6B7280', op: showCands ? 0.55 : 0.85 });
-    kakao.maps.event.addListener(bl, 'click', tapHandler);
-    ov.base.push(bl);
+    if (S.base.traffic && S.base.traffic.length && !showCands) {
+      // 실시간 정체 색상으로 경로 표시
+      drawTraffic(S.base, ov.base, 7, tapHandler);
+    } else {
+      // 정체 데이터가 없으면 반투명 띠로만 그려서 아래 카카오 교통 레이어가 비쳐 보이게
+      var bl = line(S.base.coords, { w: 18, c: '#111827', op: showCands ? 0.10 : 0.18 });
+      kakao.maps.event.addListener(bl, 'click', tapHandler);
+      ov.base.push(bl);
+    }
+    // 빨간 정체 구간: 마우스를 올리면 굵어지고, 클릭(탭)하면 회피 구간으로 추가
+    if (picking && S.jams) S.jams.forEach(function (r, i) {
+      if (S.segs.some(function (s) { return s.runIdx === i; })) return;
+      var l = line(S.base.coords.slice(r.i0, r.i1 + 1), { w: 10, c: '#DC2626', op: 1 });
+      kakao.maps.event.addListener(l, 'mouseover', function () { l.setOptions({ strokeWeight: 18 }); showJamTip(r, true); });
+      kakao.maps.event.addListener(l, 'mouseout', function () { l.setOptions({ strokeWeight: 10 }); showJamTip(r, false); });
+      kakao.maps.event.addListener(l, 'click', function () { lastTap = Date.now(); addRun(i); });
+      ov.base.push(l);
+    });
   }
   if (showCands) {
     var sel = selected();
     S.cands.forEach(function (c) {
       if (sel && c.id === sel.id) return;
-      var l = line(c.coords, { w: 6, c: '#93C5FD', op: 0.95 });
+      var l = line(c.coords, { w: 14, c: '#60A5FA', op: 0.22 });
       kakao.maps.event.addListener(l, 'click', function () { S.sel = c.id; render(); });
       ov.cands.push(l);
     });
     if (sel) {
-      ov.cands.push(line(sel.coords, { w: 13, c: '#FFFFFF', op: 1 }));
-      ov.cands.push(line(sel.coords, { w: 8, c: getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#1D4ED8', op: 1 }));
+      if (sel.traffic && sel.traffic.length) {
+        ov.cands.push(line(sel.coords, { w: 22, c: accent, op: 0.28 }));
+        drawTraffic(sel, ov.cands, 7);
+      } else {
+        ov.cands.push(line(sel.coords, { w: 20, c: accent, op: 0.3 }));
+      }
       sel.wps.forEach(function (w) { ov.marks.push(mark(w, '<div class="mk w"></div>', 6)); });
     }
   }
@@ -509,7 +788,7 @@ function render() {
   $('destTxt').textContent = S.dest ? S.dest.name : '어디로 갈까요?';
   $('destBtn').classList.toggle('empty', !S.dest);
 
-  var hint = { pickA: '정체가 시작되는 곳을 탭하세요', pickB: '정체가 끝나는 곳을 탭하세요' }[S.mode];
+  var hint = { pickA: 'A: 정체 직전 나들목(IC)을 탭하세요', pickB: 'B: 정체가 끝나는 나들목(IC)을 탭하세요' }[S.mode];
   $('hint').classList.toggle('show', !!hint); $('hintTxt').textContent = hint || '';
 
   var h = '';
@@ -527,38 +806,61 @@ function render() {
   } else if (S.mode === 'error') {
     h += '<div class="err">' + esc(S.err) + '</div><button class="btn full" data-act="retry">다시 시도</button>';
   } else if (S.mode === 'pickA' || S.mode === 'pickB') {
-    var n = S.segs.length;
-    h += '<h2>' + (n ? '정체 구간을 하나 더 찍으세요' : '정체 구간을 지도에서 탭하세요') + '</h2>';
-    h += '<p class="sub">빨간색·주황색 도로가 시작되는 곳과 끝나는 곳을 진행 방향 순서로 누르세요.</p>';
+    var n = S.segs.length, real = S.base && S.base.real, jams = S.jams || [];
+    h += '<h2>' + (n ? '피할 구간을 하나 더 고르세요' : '피할 정체 구간을 고르세요') + '</h2>';
+    if (real && jams.length) {
+      h += '<div class="jamlist"><span class="muted">지금 경로의 정체 구간 · 누르면 바로 회피 구간에 추가 (지도에서 빨간 선을 눌러도 됩니다)</span><div class="chips">';
+      jams.forEach(function (r, i) {
+        var added = S.segs.some(function (s) { return s.runIdx === i; });
+        h += '<button class="chip jam' + (added ? ' added' : '') + '" data-act="jam" data-i="' + i + '"' + (added ? ' disabled' : '') + '>' +
+          (added ? '추가됨 · ' : '') + '정체 ' + fmtKm(r.len) + (r.name ? ' · ' + esc(r.name) : '') + ' · 출발 ' + fmtKm(r.at) + ' 지점</button>';
+      });
+      h += '</div></div>';
+    } else if (real) {
+      h += '<div class="info"><b>지금 경로에 지체·정체 구간이 없어요</b><small>평소 막히는 구간을 미리 피하고 싶다면 아래처럼 A·B를 직접 찍으세요.</small></div>';
+    }
+    h += '<p class="sub">' + (real && jams.length ? '직접 지정하려면 ' : '') + '지금 경로 위에서 정체가 시작되기 직전 나들목을 A, 끝나는 나들목을 B로 누르세요. A까지는 지금 경로로 가다가, A에서 빠져나가는 길을 찾습니다.</p>';
     h += '<div class="pills"><div class="pill ' + (S.mode === 'pickA' ? 'active' : 'filled') + '"><small>A · 정체 시작</small><b>' + (S.pendingA ? '찍음' : '탭하세요') + '</b></div>' +
       '<div class="pill ' + (S.mode === 'pickB' ? 'active' : '') + '"><small>B · 정체 끝</small><b>탭하세요</b></div></div>';
-    h += '<div class="legend"><span><i style="background:var(--green)"></i>원활</span><span><i style="background:var(--orange)"></i>서행</span><span><i style="background:var(--red)"></i>정체</span><span><i style="background:#6B7280"></i>현재 경로</span></div>';
-    if (S.base) h += '<div class="info"><small>현재 경로 (정체 없을 때 기준)</small><b>' + fmtDur(S.base.dur) + ' · ' + fmtKm(S.base.dist) + '</b>' +
+    h += real
+      ? '<div class="legend"><span><i style="background:#16A34A"></i>원활</span><span><i style="background:#F59E0B"></i>서행</span><span><i style="background:#EA580C"></i>지체</span><span><i style="background:#DC2626"></i>정체</span><span><i style="background:#9CA3AF"></i>정보 없음</span></div>'
+      : '<div class="legend"><span><i style="background:var(--green)"></i>원활</span><span><i style="background:var(--orange)"></i>서행</span><span><i style="background:var(--red)"></i>정체</span><span><i style="background:rgba(17,24,39,.22);height:12px;border-radius:6px"></i>현재 경로</span></div>';
+    if (S.base) h += '<div class="info"><small>' + (real ? '지금 경로 (실시간 교통 반영)' : '지금 경로 (정체 없을 때 기준)') + '</small><b>' + fmtDur(S.base.dur) + ' · ' + fmtKm(S.base.dist) + '</b>' +
       (S.base.roads.length ? '<small>' + esc(S.base.roads.join(' · ')) + '</small>' : '') + '</div>';
     if (S.err) h += '<div class="err">' + esc(S.err) + '</div>';
     if (S.mode === 'pickB') h += '<button class="btn full" data-act="undoA">A 다시 찍기</button>';
     else if (n) h += '<button class="btn full" data-act="backResult">취소하고 결과 보기</button>';
   } else if (S.mode === 'result') {
-    var r = ranked(), sel = selected();
+    var r = ranked(), sel = selected(), realAll = S.cands.every(function (c) { return c.real; });
+    var word = realAll ? '지금 경로보다' : '평소보다';
     h += '<div class="row"><div class="grow"><span class="muted">회피 구간</span><br><b style="font-size:17px">' +
       S.segs.length + '곳 · 총 ' + fmtKm(S.segs.reduce(function (a, s) { return a + s.length; }, 0)) + '</b></div>' +
       '<button class="btn" data-act="add">구간 추가</button><button class="btn" data-act="reset">다시 찍기</button></div>';
-    h += '<span class="muted">평소보다 최대 몇 분 더 걸려도 괜찮나요?</span><div class="tols">';
+    if (S.segs.some(function (s) { return s.aAlong !== null; })) h += '<div class="info"><b>A까지는 지금 경로 그대로</b><small>A 직전에 고속도로를 빠져나와서, 그다음 목적지까지 가는 방법을 비교했어요.</small></div>';
+    h += '<span class="muted">' + word + ' 최대 몇 분 더 걸려도 괜찮나요?</span><div class="tols">';
     [5, 10, 15, 20].forEach(function (t) { h += '<button class="tol' + (S.tol === t ? ' on' : '') + '" data-act="tol" data-t="' + t + '">+' + t + '분</button>'; });
     h += '</div><div class="cards">';
+    var TITLES = { best: '최적 우회', reenter: 'B 지나서 바로 재진입', nohwy: '고속도로 없이 끝까지' };
     r.all.forEach(function (c) {
       var pass = c.extra <= S.tol, on = sel && sel.id === c.id;
       var badge = pass ? (c.id === r.best ? '<span class="badge best">추천</span>' : '<span class="badge ok">허용 범위</span>') : '<span class="badge over">+' + S.tol + '분 초과</span>';
-      var title = c.noHwy ? '고속도로 없이' : (c.roads[0] ? esc(c.roads[0]) + ' 경유' : '우회 경로');
+      if (c.hitsJam) badge += ' <span class="badge over">회피 구간 일부 통과</span>';
+      if (hasTmap() && S.base.real && !c.real) badge += ' <span class="badge over">실시간 미반영</span>';
+      var title = TITLES[c.type] || (c.roads[0] ? esc(c.roads[0]) + ' 경유' : '우회 경로');
+      var parts = [];
+      if (c.exitBefore != null) parts.push(c.exitBefore < 400 ? 'A에서 나감' : 'A ' + fmtKm(c.exitBefore) + ' 전 출구로 나감');
+      if (c.type !== 'alt') parts.push(c.rejoin ? 'B 뒤에서 고속도로 재진입' : '재진입 없이 목적지까지');
+      if (c.real) { var jr = jamRuns({ coords: c.coords, traffic: c.traffic, names: c.names }); parts.push(jr.length ? '정체 ' + jr.length + '곳 남음' : '정체 없음'); }
+      if (c.roads.length) parts.push(c.roads.slice(0, 2).join(' · '));
       h += '<button class="card' + (pass ? '' : ' fail') + (on ? ' on' : '') + '" data-act="pick" data-id="' + c.id + '">' +
-        '<span class="l"><span class="nm">' + title + ' ' + badge + '</span><span class="rd">' + esc(c.roads.join(' · ') || '주요 도로 정보 없음') + '</span></span>' +
+        '<span class="l"><span class="nm">' + title + ' ' + badge + '</span><span class="rd">' + esc(parts.join(' · ') || '주요 도로 정보 없음') + '</span></span>' +
         '<span class="r"><span class="ex">' + (c.extra >= 0 ? '+' : '') + c.extra + '분</span><span class="mt">' + fmtDur(c.dur) + ' · ' + fmtKm(c.dist) + '</span></span></button>';
     });
     h += '</div>';
     if (!r.pass.length) h += '<span class="muted">허용 범위 안의 경로가 없어요. 가장 나은 경로를 고르거나 허용 시간을 늘려보세요.</span>';
-    h += '<span class="muted">시간은 정체가 없을 때 기준이라 실제 정체 구간을 지날 때보다 보수적으로 잡힙니다.</span>';
+    h += '<span class="muted">' + (realAll ? '시간은 실시간 교통을 반영한 예상 시간이고, 지도의 우회 경로 색은 그 길의 현재 정체 상황입니다.' : '시간은 정체가 없을 때 기준이라 실제 정체 구간을 지날 때보다 보수적으로 잡힙니다.') + '</span>';
     if (sel) h += '<button class="btn primary" data-act="send"><svg viewBox="0 0 24 24"><path d="M3 11l18-8-8 18-2-8-8-2z"></path></svg><span>네이버 지도로 안내 시작<small>' +
-      (sel.extra >= 0 ? '평소보다 +' : '평소보다 ') + sel.extra + '분 · 경유지 ' + sel.wps.length + '곳</small></span></button>';
+      word + ' ' + (sel.extra >= 0 ? '+' : '') + sel.extra + '분 · 경유지 ' + sel.wps.length + '곳</small></span></button>';
   }
   $('sheetBody').innerHTML = h;
   if (map) draw();
@@ -644,6 +946,7 @@ document.addEventListener('click', function (e) {
   if (a === 'search') openSearch('dest');
   else if (a === 'recent') { var r = LS.get('recent', [])[+b.dataset.i]; S.editing = 'dest'; choosePlace({ name: r.name, lat: r.lat, lng: r.lng, addr: r.addr }); }
   else if (a === 'retry') { if (!map) location.reload(); else loadBase(); }
+  else if (a === 'jam') addRun(+b.dataset.i);
   else if (a === 'undoA') { S.pendingA = null; S.mode = 'pickA'; render(); }
   else if (a === 'backResult') { S.pendingA = null; S.mode = 'result'; render(); }
   else if (a === 'add') { S.mode = 'pickA'; S.err = ''; render(); toast('추가로 피할 정체 구간의 시작점을 탭하세요'); }
@@ -672,7 +975,7 @@ $('setBtn').onclick = function () { showSetup(true); };
 
 /* ---------- 설정 / 시작 ---------- */
 function showSetup(closable) {
-  $('kakaoKey').value = LS.get('kakaoKey', ''); $('orsKey').value = LS.get('orsKey', '');
+  $('kakaoKey').value = LS.get('kakaoKey', ''); $('orsKey').value = LS.get('orsKey', ''); $('tmapKey').value = LS.get('tmapKey', '');
   $('closeSetup').style.display = closable ? 'block' : 'none';
   $('setup').classList.add('show');
 }
@@ -680,10 +983,11 @@ $('closeSetup').onclick = function () { $('setup').classList.remove('show'); };
 $('saveKeys').onclick = function () {
   var k = $('kakaoKey').value.trim(), o = $('orsKey').value.trim();
   if (!k || !o) { toast('두 키를 모두 입력해 주세요'); return; }
-  var changedKakao = k !== LS.get('kakaoKey', '');
-  LS.set('kakaoKey', k); LS.set('orsKey', o);
+  var tk = $('tmapKey').value.trim();
+  var changed = k !== LS.get('kakaoKey', '') || tk !== LS.get('tmapKey', '');
+  LS.set('kakaoKey', k); LS.set('orsKey', o); LS.set('tmapKey', tk);
   $('setup').classList.remove('show');
-  if (changedKakao || !map) location.reload();
+  if (changed || !map) location.reload();
 };
 
 function loadKakao(key) {
