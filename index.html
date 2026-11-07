@@ -554,10 +554,49 @@ function isAuthErr(e) { return e && (e.status === 401 || e.status === 403 || e.s
 
 /* ---------- 도로 조건: 좁은 길·농로·골목, 어린이 보호구역 ---------- */
 function opt(k) { return LS.get('opt_' + k, k === 'narrow'); }
-function orsX(coords, polys, feats) {
-  var o = { options: { avoid_polygons: { type: 'MultiPolygon', coordinates: polys } }, extra_info: ['waytype', 'waycategory'] };
-  if (feats) o.options.avoid_features = feats;
-  return ors(coords, o);
+function orsX(coords, polys, feats, heading) {
+  function body(withHeading) {
+    var o = { options: { avoid_polygons: { type: 'MultiPolygon', coordinates: polys } }, extra_info: ['waytype', 'waycategory'] };
+    if (feats) o.options.avoid_features = feats;
+    // 고속도로 위 출발점이 반대 방향 차로에 붙지 않도록 진행 방향 지정
+    if (withHeading) o.bearings = coords.map(function (c, i) { return i === 0 ? [Math.round(heading), 45] : [0, 180]; });
+    return o;
+  }
+  if (heading == null) return ors(coords, body(false));
+  return ors(coords, body(true)).catch(function (e) { if (isAuthErr(e)) throw e; return ors(coords, body(false)); });
+}
+// 기준 경로 위 특정 지점에서의 진행 방향(북쪽 기준 시계방향 각도)
+function headingAt(route, along) {
+  var a = pointAt(route.coords, route.cum, Math.max(0, along - 60)), b = pointAt(route.coords, route.cum, along + 60);
+  var r = Math.PI / 180, y = Math.sin((b[0] - a[0]) * r) * Math.cos(b[1] * r);
+  var x = Math.cos(a[1] * r) * Math.sin(b[1] * r) - Math.sin(a[1] * r) * Math.cos(b[1] * r) * Math.cos((b[0] - a[0]) * r);
+  return (Math.atan2(y, x) / r + 360) % 360;
+}
+// 기준 경로를 처음부터 along 지점까지 그대로 잘라서 사용 (A까지는 지금 경로 그대로)
+function prefixOf(route, along) {
+  var out = [], total = route.cum[route.cum.length - 1];
+  for (var i = 0; i < route.coords.length && route.cum[i] < along; i++) out.push(route.coords[i]);
+  out.push(pointAt(route.coords, route.cum, along));
+  return { coords: out, dist: along, dur: route.dur * (along / (total || 1)) };
+}
+/* 경유지: A와 나란한 지점부터 B 직전까지 약 2.5km 간격.
+   회피 구간 안에서는 차단 때문에 고속도로를 탈 수 없으므로 고속도로에서 80m만 떨어져 있어도 확실한 우회 지점.
+   재진입하지 않는 경로는 B 이후 국도 구간에도 하나 둔다. 최대 5개, 경로 순서대로 */
+function waypointsAlong(coords, m, aAlong, lastB) {
+  var C = thin(coords, 100), cum = 0, pts = [];
+  for (var i = 0; i < C.length; i++) { if (i) cum += hav(C[i - 1], C[i]); var r = m(C[i]); pts.push({ c: C[i], at: cum, along: r.along, d: r.d }); }
+  var exit = null;
+  for (i = 0; i < pts.length; i++) if (pts[i].d > 80 && pts[i].along > aAlong - 15000) { exit = pts[i]; break; }
+  var span = Math.max(500, lastB - aAlong);
+  var beside = pts.filter(function (q) { return q.d > 80 && q.along >= aAlong - 1500 && q.along <= lastB - 200; });
+  var after = pts.filter(function (q) { return q.d > 500 && q.along > lastB + 3000; });
+  var n = Math.min(after.length ? 4 : 5, Math.max(2, Math.ceil(span / 2500) + 1)), picked = [];
+  function add(q) { if (q && !picked.some(function (p) { return hav(p.c, q.c) < 700; })) picked.push(q); }
+  function near(t, pool) { var bp = null; pool.forEach(function (q) { if (!bp || Math.abs(q.along - t) < Math.abs(bp.along - t)) bp = q; }); return bp; }
+  if (beside.length) for (var k = 0; k < n; k++) add(near(aAlong + span * k / Math.max(1, n - 0.5), beside));
+  if (after.length && picked.length < 5) add(after[Math.floor(after.length / 2)]);
+  picked.sort(function (x, y) { return x.at - y.at; });
+  return { wps: picked.slice(0, 5).map(function (q) { return q.c; }), exitAlong: exit ? exit.along : null };
 }
 // 경로 안의 좁은 길 구간 찾기
 // waytype: 3 동네길(residential 등), 4 오솔길, 5 농로·임도(track), 6~8 자전거·보행로
@@ -652,18 +691,19 @@ function computeCands() {
   function attempt(k) {
     if (k >= offs.length) return Promise.reject(new Error('A 앞에서 빠져나갈 길을 찾지 못했어요. A를 정체 직전 나들목(IC)에 찍어보세요'));
     var pAlong = aAlong - offs[k], atStart = pAlong <= 300;
-    var P = atStart ? Sx : pointAt(base.coords, base.cum, pAlong);
-    return orsX([P, D], polys).then(function (r) {
-      return { P: P, atStart: atStart, best: r[0] };
+    var P = atStart ? Sx : pointAt(base.coords, base.cum, pAlong), h = atStart ? null : headingAt(base, pAlong);
+    return orsX([P, D], polys, null, h).then(function (r) {
+      return { P: P, atStart: atStart, best: r[0], pAlong: atStart ? 0 : pAlong, h: h };
     }, function (e) {
       if (isAuthErr(e) || atStart) throw e;
       return attempt(k + 1);
     });
   }
   // P에서 갈라지는 세 가지: 최적 / B 뒤 재진입 / 고속도로 없이
+  var H = null;
   function build(P, ps, preBest) {
-    return (preBest ? Promise.resolve(preBest) : orsX([P, D], ps).then(function (r) { return r[0]; })).then(function (best) {
-      var pRe = R ? orsX([P, R, D], ps).then(function (r) { return r[0]; }).catch(function () { return null; }) : Promise.resolve(null);
+    return (preBest ? Promise.resolve(preBest) : orsX([P, D], ps, null, H).then(function (r) { return r[0]; })).then(function (best) {
+      var pRe = R ? orsX([P, R, D], ps, null, H).then(function (r) { return r[0]; }).catch(function () { return null; }) : Promise.resolve(null);
       var info = analyze(best.coords, m, lastB, total - 5000), pNo = Promise.resolve(null);
       if (info.runs.length) {
         var X = info.runs[0].pts[0].c, xi = nearestIdx(best.coords, X).i;
@@ -690,7 +730,8 @@ function computeCands() {
 
   return attempt(0).then(function (st) {
     var ctx = { P: st.P, seen: {}, schools: {} };
-    var pPrefix = st.atStart ? Promise.resolve(null) : ors([Sx, st.P]).then(function (r) { return r[0]; });
+    H = st.h;
+    var pPrefix = Promise.resolve(st.atStart ? null : prefixOf(base, st.pAlong));
     return Promise.all([pPrefix, build(st.P, polys, st.best).then(function (sx) { return solve(ctx, polys, sx, 0); })]).then(function (res) {
       var pre = res[0], sx = res[1];
       function join(suf, type, minor) {
@@ -743,8 +784,14 @@ function finishCands(list, m, aAlong, lastB, total) {
   uniq.forEach(function (c, i) {
     var inf = analyze(c.coords, m, lastB == null ? 0 : lastB, total - 5000);
     c.id = 'c' + i;
-    c.wps = waypointsFrom(inf.runs, aAlong, lastB);
-    c.exitBefore = (aAlong != null && inf.divAlong != null) ? Math.max(0, aAlong - inf.divAlong) : null;
+    if (aAlong != null) {
+      var wa = waypointsAlong(c.coords, m, aAlong, lastB);
+      c.wps = wa.wps;
+      c.exitBefore = wa.exitAlong != null ? Math.max(0, aAlong - wa.exitAlong) : null;
+    } else {
+      c.wps = waypointsFrom(inf.runs, null, null);
+      c.exitBefore = null;
+    }
     c.rejoin = inf.rejoin != null;
   });
   return retime(uniq).then(function () {
