@@ -121,6 +121,10 @@ p.sub{margin:0;font-size:15px;line-height:1.5;color:var(--ink3)}
 .chip.opt.on{border-color:var(--ink);font-weight:600}
 .chip.opt.on i{background:var(--ink);border-color:var(--ink);box-shadow:inset 0 0 0 3px #fff}
 .chip.jam{border-color:#FCA5A5;background:#FEF2F2;color:#991B1B;font-weight:600}
+.seg2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;padding:4px;border-radius:14px;background:var(--soft)}
+.seg2 button{height:44px;border:0;border-radius:10px;background:none;font-size:15px;font-weight:600;color:var(--ink3)}
+.seg2 button.on{background:var(--bg);color:var(--ink);box-shadow:0 1px 4px rgba(17,24,39,.15)}
+.chip.jam.picked{border:2px solid #991B1B;background:#991B1B;color:#fff}
 .chip.jam.added{border-color:var(--line);background:var(--soft);color:var(--ink3);font-weight:500}
 .jamlist{display:flex;flex-direction:column;gap:8px}
 .jamlist .chips{gap:6px}
@@ -266,6 +270,7 @@ var S = {
   err: '',
   traffic: true,
   sheet: 'half',
+  tool: 'jam',            // 'jam' 정체 구간 고르기 | 'ab' A·B 직접 찍기
   vias: [],               // 꼭 지나갈 길 점들 (viaGroups에서 만들어짐)
   viaLabels: [],
   viaGroups: [],          // [{name, pts:[[lng,lat],..]}] 최대 2개 도로(점 4개)
@@ -533,7 +538,6 @@ function loadBase() {
 }
 
 function addSegment(a, b) {
-  S.mode = 'computing'; render();
   var base = S.base, na = nearestIdx(base.coords, a), nb = nearestIdx(base.coords, b), getPath;
   var near = na.d < 600 && nb.d < 600;
   if (near && nb.i < na.i) {
@@ -544,6 +548,7 @@ function addSegment(a, b) {
   if (onBase) {
     getPath = Promise.resolve({ coords: base.coords.slice(na.i, nb.i + 1) });
   } else {
+    S.mode = 'computing'; render();
     var straight = hav(a, b);
     getPath = ors([a, b]).then(function (r) {
       var path = r[0];
@@ -554,26 +559,38 @@ function addSegment(a, b) {
     });
   }
   getPath.then(function (path) {
-    return pushSeg({ a: a, b: b, coords: path.coords, aAlong: onBase ? base.cum[na.i] : null, bAlong: onBase ? base.cum[nb.i] : null });
+    addSegLocal({ a: a, b: b, coords: path.coords, aAlong: onBase ? base.cum[na.i] : null, bAlong: onBase ? base.cum[nb.i] : null });
+    toast('직접 지정한 구간을 추가했어요. 더 고르거나 "경로 찾기"를 누르세요');
   }).catch(fail);
 }
 
-function pushSeg(seg) {
+// 피할 구간을 선택 목록에만 추가 (계산은 '경로 찾기' 버튼에서 한 번에)
+function addSegLocal(seg) {
   var bx = boxesAlong(seg.coords);
   seg.boxes = bx.boxes; seg.length = bx.length;
-  S.segs.push(seg);
-  return computeCands().catch(function (e) { S.segs.pop(); throw e; });
+  S.segs.push(seg); S.cands = []; S.err = '';
+  S.mode = 'pickA'; sheetState('half'); render();
 }
-
-// 경로 위 빨간 정체 구간을 눌러서 바로 회피 구간으로 추가
+function removeSeg(i) {
+  S.segs.splice(i, 1); S.cands = []; S.pendingA = null;
+  S.mode = 'pickA'; render();
+}
+// 자동으로 찾은 정체 구간: 누를 때마다 선택/해제
 function addRun(i) {
   var r = S.jams && S.jams[i], base = S.base;
   if (!r) return;
-  if (S.segs.some(function (s) { return s.runIdx === i; })) { toast('이미 추가된 구간이에요'); return; }
-  S.pendingA = null; S.err = '';
-  S.mode = 'computing'; render();
-  pushSeg({ a: base.coords[r.i0], b: base.coords[r.i1], coords: base.coords.slice(r.i0, r.i1 + 1),
-    aAlong: base.cum[r.i0], bAlong: base.cum[r.i1], runIdx: i }).catch(fail);
+  var k = -1;
+  S.segs.forEach(function (s, j) { if (s.runIdx === i) k = j; });
+  if (k >= 0) { removeSeg(k); return; }
+  S.pendingA = null;
+  addSegLocal({ a: base.coords[r.i0], b: base.coords[r.i1], coords: base.coords.slice(r.i0, r.i1 + 1),
+    aAlong: base.cum[r.i0], bAlong: base.cum[r.i1], runIdx: i });
+}
+// 선택한 구간을 모두 피하는 경로 찾기
+function runSearch() {
+  if (!S.segs.length) { toast('피할 구간을 먼저 고르세요'); return; }
+  S.pendingA = null;
+  computeCands().catch(fail);
 }
 
 function isAuthErr(e) { return e && (e.status === 401 || e.status === 403 || e.status === 429); }
@@ -990,7 +1007,7 @@ function showJamTip(r, on) {
   var mid = S.base.coords[Math.round((r.i0 + r.i1) / 2)];
   var el = document.createElement('div');
   el.style.cssText = 'transform:translateY(-26px);background:#991B1B;color:#fff;font-size:13px;font-weight:700;padding:6px 10px;border-radius:8px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.25)';
-  el.textContent = '정체 ' + fmtKm(r.len) + ' · 클릭하면 회피 구간에 추가';
+  el.textContent = '정체 ' + fmtKm(r.len) + ' · 클릭해서 피할 구간으로 선택';
   jamTip = new kakao.maps.CustomOverlay({ map: map, position: LL(mid), content: el, xAnchor: 0.5, yAnchor: 1, zIndex: 20 });
 }
 
@@ -1010,7 +1027,7 @@ function draw() {
       ov.base.push(bl);
     }
     // 빨간 정체 구간: 마우스를 올리면 굵어지고, 클릭(탭)하면 회피 구간으로 추가
-    if (picking && S.jams) S.jams.forEach(function (r, i) {
+    if (picking && S.jams && curTool() === 'jam') S.jams.forEach(function (r, i) {
       if (S.segs.some(function (s) { return s.runIdx === i; })) return;
       var l = line(S.base.coords.slice(r.i0, r.i1 + 1), { w: 10, c: '#DC2626', op: 1 });
       kakao.maps.event.addListener(l, 'mouseover', function () { l.setOptions({ strokeWeight: 18 }); showJamTip(r, true); });
@@ -1040,7 +1057,10 @@ function draw() {
   S.segs.forEach(function (s, i) {
     var a = line(s.coords, { w: 16, c: '#111827', op: 0.35 });
     var b = line(s.coords, { w: 3, c: '#FFFFFF', op: 1, st: 'shortdash' });
-    kakao.maps.event.addListener(a, 'click', tapHandler);
+    kakao.maps.event.addListener(a, 'click', function (me) {
+      if (S.mode === 'pickA' && curTool() === 'jam') { lastTap = Date.now(); removeSeg(i); toast('선택을 해제했어요'); }
+      else tapHandler(me);
+    });
     ov.segs.push(a, b);
     var n = S.segs.length > 1 ? (i + 1) : '';
     ov.marks.push(mark(s.a, '<div class="mk">A' + n + '</div>', 8));
@@ -1056,7 +1076,10 @@ function draw() {
 /* ---------- 탭 처리 ---------- */
 function onTap(p) {
   if (S.mode === 'pickVia') { findRoadsNear(p); return; }
-  if (S.mode === 'pickA') { S.pendingA = p; S.mode = 'pickB'; sheetState('peek'); render(); return; }
+  if (S.mode === 'pickA') {
+    if (curTool() === 'jam') { toast('지도에서 직접 찍으려면 아래에서 "A·B 직접 찍기"를 고르세요'); return; }
+    S.pendingA = p; S.mode = 'pickB'; sheetState('peek'); render(); return;
+  }
   if (S.mode === 'pickB') {
     if (hav(S.pendingA, p) < 300) { toast('A와 너무 가까워요. 정체가 끝나는 지점을 탭하세요'); return; }
     var a = S.pendingA; S.pendingA = null; addSegment(a, p); return;
@@ -1077,6 +1100,7 @@ function optsHtml() {
     '<button class="chip opt' + (opt('kids') ? ' on' : '') + '" data-act="opt" data-k="kids"><i></i>어린이 보호구역 피하기</button></div>';
 }
 
+function curTool() { return (S.base && S.base.real && S.jams && S.jams.length) ? S.tool : 'ab'; }
 function sheetState(st) {
   S.sheet = st;
   var el = $('sheet');
@@ -1093,7 +1117,7 @@ function peekText() {
   if (S.mode === 'viaLoading') return '주변 도로 찾는 중…';
   if (S.mode === 'viaChoose') return '지나갈 도로를 고르세요';
   if (S.mode === 'saved') return '★ ' + (S.routeName || '저장한 경로');
-  if (S.mode === 'pickA') return '피할 구간 고르기' + (S.jams && S.jams.length ? ' · 정체 ' + S.jams.length + '곳' : '') + (S.segs.length ? ' · 추가됨 ' + S.segs.length : '');
+  if (S.mode === 'pickA') return S.segs.length ? S.segs.length + '곳 선택됨 · 펼쳐서 경로 찾기' : '피할 구간 고르기' + (S.jams && S.jams.length ? ' · 정체 ' + S.jams.length + '곳' : '');
   if (S.mode === 'result') {
     var c = selected(), T = { best: '최적 우회', reenter: 'B 지나서 바로 재진입', nohwy: '고속도로 없이 끝까지' };
     return c ? (T[c.type] || '우회 경로') + ' ' + (c.extra >= 0 ? '+' : '') + c.extra + '분 · 경유지 ' + c.wps.length + '곳' : '결과';
@@ -1107,7 +1131,7 @@ function render() {
   $('destTxt').textContent = S.dest ? S.dest.name : '어디로 갈까요?';
   $('destBtn').classList.toggle('empty', !S.dest);
 
-  var hint = { pickA: 'A: 정체 직전 나들목(IC)을 탭하세요', pickB: 'B: 정체가 끝나는 나들목(IC)을 탭하세요', pickVia: '꼭 지나갈 길 근처를 탭하세요' }[S.mode];
+  var hint = { pickA: curTool() === 'jam' ? '빨간 정체 구간을 눌러 고르세요' : 'A: 피할 구간이 시작되는 곳을 탭하세요', pickB: 'B: 정체가 끝나는 나들목(IC)을 탭하세요', pickVia: '꼭 지나갈 길 근처를 탭하세요' }[S.mode];
   $('hint').classList.toggle('show', !!hint); $('hintTxt').textContent = hint || '';
 
   var h = '';
@@ -1150,23 +1174,34 @@ function render() {
     h += '<div class="err">' + esc(S.err) + '</div><button class="btn full" data-act="retry">다시 시도</button>';
   } else if (S.mode === 'pickA' || S.mode === 'pickB') {
     var n = S.segs.length, real = S.base && S.base.real, jams = S.jams || [];
-    h += '<h2>' + (n ? '피할 구간을 하나 더 고르세요' : '피할 정체 구간을 고르세요') + '</h2>';
-    if (real && jams.length) {
-      h += '<div class="jamlist"><span class="muted">지금 경로의 정체 구간 · 누르면 바로 회피 구간에 추가 (지도에서 빨간 선을 눌러도 됩니다)</span><div class="chips">';
+    h += '<h2>피할 구간을 고르세요' + (n ? ' · ' + n + '곳 선택' : '') + '</h2>';
+    var tool = curTool();
+    if (real && jams.length) h += '<div class="seg2" role="tablist">' +
+      '<button class="' + (tool === 'jam' ? 'on' : '') + '" data-act="tool" data-t="jam" role="tab" aria-selected="' + (tool === 'jam') + '">정체 구간 고르기</button>' +
+      '<button class="' + (tool === 'ab' ? 'on' : '') + '" data-act="tool" data-t="ab" role="tab" aria-selected="' + (tool === 'ab') + '">A·B 직접 찍기</button></div>';
+    if (real && jams.length && tool === 'jam') {
+      h += '<div class="jamlist"><span class="muted">지금 경로의 정체 구간 · 여러 곳을 눌러 고르세요 (다시 누르면 해제, 지도의 빨간 선을 눌러도 됩니다)</span><div class="chips">';
       jams.forEach(function (r, i) {
         var added = S.segs.some(function (s) { return s.runIdx === i; });
-        h += '<button class="chip jam' + (added ? ' added' : '') + '" data-act="jam" data-i="' + i + '"' + (added ? ' disabled' : '') + '>' +
-          (added ? '추가됨 · ' : '') + '정체 ' + fmtKm(r.len) + (r.name ? ' · ' + esc(r.name) : '') + ' · 출발 ' + fmtKm(r.at) + ' 지점</button>';
+        h += '<button class="chip jam' + (added ? ' picked' : '') + '" data-act="jam" data-i="' + i + '" aria-pressed="' + added + '">' +
+          (added ? '✓ ' : '') + '정체 ' + fmtKm(r.len) + (r.name ? ' · ' + esc(r.name) : '') + ' · 출발 ' + fmtKm(r.at) + ' 지점</button>';
       });
       h += '</div></div>';
-    } else if (real) {
+    } else if (real && !jams.length) {
       h += '<div class="info"><b>지금 경로에 지체·정체 구간이 없어요</b><small>평소 막히는 구간을 미리 피하고 싶다면 아래처럼 A·B를 직접 찍으세요.</small></div>';
     }
-    h += '<p class="sub">' + (real && jams.length ? '직접 지정하려면 ' : '') + '지금 경로 위에서 정체가 시작되기 직전 나들목을 A, 끝나는 나들목을 B로 누르세요. A까지는 지금 경로로 가다가, A에서 빠져나가는 길을 찾습니다.</p>';
+    var manual = S.segs.map(function (s, i) { return { s: s, i: i }; }).filter(function (x) { return x.s.runIdx == null; });
+    if (manual.length) {
+      h += '<div class="chips">';
+      manual.forEach(function (x, k) { h += '<button class="chip jam picked" data-act="delSeg" data-i="' + x.i + '">직접 지정 ' + (k + 1) + ' · ' + fmtKm(x.s.length) + ' ✕</button>'; });
+      h += '</div>';
+    }
+    if (n) h += '<button class="btn primary" data-act="runSearch">선택한 ' + n + '곳 피해서 경로 찾기</button>';
+    if (tool === 'ab') h += '<p class="sub">지금 경로 위에서 피할 구간이 시작되는 곳(보통 그 직전 나들목)을 A, 끝나는 곳을 B로 누르세요. 빨간 정체 구간 위도 찍을 수 있어서, 정체를 조금 거쳐 가거나 네이버 정체 정보에 맞춰 범위를 정할 수 있어요. A까지는 지금 경로로 가다가, A에서 빠져나가는 길을 찾습니다.</p>';
     h += viaHtml();
     h += optsHtml();
-    h += '<div class="pills"><div class="pill ' + (S.mode === 'pickA' ? 'active' : 'filled') + '"><small>A · 정체 시작</small><b>' + (S.pendingA ? '찍음' : '탭하세요') + '</b></div>' +
-      '<div class="pill ' + (S.mode === 'pickB' ? 'active' : '') + '"><small>B · 정체 끝</small><b>탭하세요</b></div></div>';
+    if (tool === 'ab') h += '<div class="pills"><div class="pill ' + (S.mode === 'pickA' ? 'active' : 'filled') + '"><small>A · 피할 구간 시작</small><b>' + (S.pendingA ? '찍음' : '탭하세요') + '</b></div>' +
+      '<div class="pill ' + (S.mode === 'pickB' ? 'active' : '') + '"><small>B · 피할 구간 끝</small><b>탭하세요</b></div></div>';
     h += real
       ? '<div class="legend"><span><i style="background:#16A34A"></i>원활</span><span><i style="background:#F59E0B"></i>서행</span><span><i style="background:#EA580C"></i>지체</span><span><i style="background:#DC2626"></i>정체</span><span><i style="background:#9CA3AF"></i>정보 없음</span></div>'
       : '<div class="legend"><span><i style="background:var(--green)"></i>원활</span><span><i style="background:var(--orange)"></i>서행</span><span><i style="background:var(--red)"></i>정체</span><span><i style="background:rgba(17,24,39,.22);height:12px;border-radius:6px"></i>현재 경로</span></div>';
@@ -1174,7 +1209,7 @@ function render() {
       (S.base.roads.length ? '<small>' + esc(S.base.roads.join(' · ')) + '</small>' : '') + '</div>';
     if (S.err) h += '<div class="err">' + esc(S.err) + '</div>';
     if (S.mode === 'pickB') h += '<button class="btn full" data-act="undoA">A 다시 찍기</button>';
-    else if (n) h += '<button class="btn full" data-act="backResult">취소하고 결과 보기</button>';
+    else if (S.cands.length) h += '<button class="btn full" data-act="backResult">취소하고 결과 보기</button>';
   } else if (S.mode === 'result') {
     var r = ranked(), sel = selected(), realAll = S.cands.every(function (c) { return c.real; });
     var word = realAll ? '지금 경로보다' : '평소보다';
@@ -1445,6 +1480,8 @@ document.addEventListener('click', function (e) {
   else if (a === 'recent') { var r = LS.get('recent', [])[+b.dataset.i]; S.editing = 'dest'; choosePlace({ name: r.name, lat: r.lat, lng: r.lng, addr: r.addr }); }
   else if (a === 'retry') { if (!map) location.reload(); else loadBase(); }
   else if (a === 'jam') addRun(+b.dataset.i);
+  else if (a === 'delSeg') removeSeg(+b.dataset.i);
+  else if (a === 'runSearch') runSearch();
   else if (a === 'opt') {
     var k = b.dataset.k; LS.set('opt_' + k, !opt(k)); render();
     if (S.mode === 'result' && S.segs.length) computeCands().catch(fail);
@@ -1463,9 +1500,10 @@ document.addEventListener('click', function (e) {
   }
   else if (a === 'check') { if (!S.start) { toast('현재 위치를 찾는 중이에요'); return; } loadBase(); }
   else if (a === 'newDest') { S.dest = null; S.viaGroups = []; syncVias(); S.routeName = ''; S.base = null; S.mode = 'needDest'; render(); }
+  else if (a === 'tool') { S.tool = b.dataset.t; S.pendingA = null; S.mode = 'pickA'; render(); }
   else if (a === 'undoA') { S.pendingA = null; S.mode = 'pickA'; render(); }
   else if (a === 'backResult') { S.pendingA = null; S.mode = 'result'; render(); }
-  else if (a === 'add') { S.mode = 'pickA'; S.err = ''; render(); toast('추가로 피할 정체 구간의 시작점을 탭하세요'); }
+  else if (a === 'add') { S.mode = 'pickA'; S.err = ''; render(); toast('피할 구간을 더 고르고 "경로 찾기"를 누르세요'); }
   else if (a === 'reset') { S.segs = []; S.cands = []; S.sel = null; S.mode = 'pickA'; S.err = ''; render(); if (S.base) fitTo(S.base.coords); }
   else if (a === 'tol') { S.tol = +b.dataset.t; S.sel = null; LS.set('tol', S.tol); render(); }
   else if (a === 'pick') { S.sel = b.dataset.id; render(); }
