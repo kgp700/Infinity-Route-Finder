@@ -202,6 +202,7 @@ p.sub{margin:0;font-size:15px;line-height:1.5;color:var(--ink3)}
   <div id="setup">
     <div class="wrap">
       <h2>처음 한 번만 설정하면 됩니다</h2>
+      <div class="err" id="setupErr" style="display:none"></div>
       <p class="sub">이 앱은 서버 없이 폰에서 바로 지도(카카오맵)와 경로 계산(OpenRouteService)을 불러옵니다. 둘 다 무료 키가 필요해요. 키는 이 폰에만 저장됩니다.</p>
       <label>카카오 JavaScript 키
         <input id="kakaoKey" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="예: 1a2b3c...">
@@ -642,7 +643,7 @@ document.addEventListener('click', function (e) {
   var a = b.getAttribute('data-act');
   if (a === 'search') openSearch('dest');
   else if (a === 'recent') { var r = LS.get('recent', [])[+b.dataset.i]; S.editing = 'dest'; choosePlace({ name: r.name, lat: r.lat, lng: r.lng, addr: r.addr }); }
-  else if (a === 'retry') loadBase();
+  else if (a === 'retry') { if (!map) location.reload(); else loadBase(); }
   else if (a === 'undoA') { S.pendingA = null; S.mode = 'pickA'; render(); }
   else if (a === 'backResult') { S.pendingA = null; S.mode = 'result'; render(); }
   else if (a === 'add') { S.mode = 'pickA'; S.err = ''; render(); toast('추가로 피할 정체 구간의 시작점을 탭하세요'); }
@@ -706,8 +707,15 @@ function boot() {
     render(); locate(false);
   }).catch(function () {
     S.mode = 'error';
-    S.err = '지도를 불러오지 못했어요. 인터넷 연결, 카카오 JavaScript 키, 카카오 콘솔에 이 사이트 주소(' + location.origin + ')가 등록됐는지 확인해 주세요.';
+    S.err = '카카오 지도를 불러오지 못했어요.';
     render(); showSetup(true);
+    var el = $('setupErr');
+    el.innerHTML = '<b>카카오 지도를 불러오지 못했어요.</b> 키는 저장됐습니다. 아래를 확인해 주세요.<br>' +
+      '1. 카카오 콘솔 → 앱 설정 → 플랫폼 키 → JavaScript 키 → <b>JavaScript SDK 도메인</b>에 <b>' + esc(location.origin) + '</b> 가 정확히 등록됐는지 (뒤에 / 나 경로 없이)<br>' +
+      '2. 왼쪽 메뉴 <b>카카오맵</b> 사용 설정이 켜져 있는지<br>' +
+      '3. 입력한 키가 REST API 키가 아니라 <b>JavaScript 키</b>인지<br>' +
+      '4. 방금 등록했다면 몇 분 뒤 다시 시도';
+    el.style.display = 'block';
   });
 }
 
